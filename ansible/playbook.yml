@@ -75,6 +75,7 @@
     repl_user: repl_user
     repl_pass: "{{ repl_pass }}"
     app_dir: /root/fastapi_crud
+    remote_port: 5433
   tasks:
     - name: Ensure app directory exists
       file:
@@ -101,6 +102,38 @@
       apt:
         name: [postgresql, python3-psycopg2, python3-pip, python3-venv]
         state: present
+    - name: Start PostgreSQL on remote
+      service:
+        name: postgresql
+        state: started
+    - name: Get PostgreSQL version
+      command: pg_config --version
+      register: pg_version
+      changed_when: false
+    - name: Set conf path
+      set_fact:
+        pg_conf_path: "/etc/postgresql/{{ pg_version.stdout.split()[1].split('.')[0] }}/main/postgresql.conf"
+        pg_data_dir: "/var/lib/postgresql/{{ pg_version.stdout.split()[1].split('.')[0] }}/main"
+    - name: Set PostgreSQL port on remote
+      lineinfile:
+        path: "{{ pg_conf_path }}"
+        regexp: '^port ='
+        line: 'port = {{ remote_port }}'
+      notify: Restart PostgreSQL on remote
+    - name: Set listen_addresses on remote
+      lineinfile:
+        path: "{{ pg_conf_path }}"
+        regexp: '^listen_addresses ='
+        line: "listen_addresses = '*'"
+      notify: Restart PostgreSQL on remote
+    - meta: flush_handlers
+    - name: Set postgres password on remote
+      postgresql_user:
+        name: postgres
+        password: "{{ db_pass }}"
+        encrypted: yes
+        login_port: "{{ remote_port }}"
+        login_host: localhost
     - name: Create DB
       postgresql_db:
         name: "{{ db_name }}"
@@ -108,7 +141,7 @@
         login_user: "{{ db_user }}"
         login_password: "{{ db_pass }}"
         login_host: localhost
-        login_port: 5433
+        login_port: "{{ remote_port }}"
     - name: Create DB user
       postgresql_user:
         name: "{{ db_user }}"
@@ -118,7 +151,7 @@
         login_user: "{{ db_user }}"
         login_password: "{{ db_pass }}"
         login_host: localhost
-        login_port: 5433
+        login_port: "{{ remote_port }}"
     - name: Configure primary for replication
       delegate_to: localhost
       lineinfile:
@@ -142,14 +175,14 @@
         line: "host replication {{ repl_user }} 0.0.0.0/0 md5"
       notify: Restart PostgreSQL local
     - name: Initial sync to remote
-      command: pg_basebackup -h {{ primary_ip }} -p 5433 -D /var/lib/postgresql/*/main -U {{ repl_user }} -v -P --wal-method=stream
+      command: pg_basebackup -h {{ primary_ip }} -p 5433 -D {{ pg_data_dir }} -U {{ repl_user }} -v -P --wal-method=stream
       become_user: postgres
     - name: Configure standby on remote
       copy:
         content: |
           standby_mode = 'on'
           primary_conninfo = 'host={{ primary_ip }} port=5433 user={{ repl_user }} password={{ repl_pass }}'
-        dest: /var/lib/postgresql/*/main/recovery.conf
+        dest: "{{ pg_data_dir }}/recovery.conf"
       become_user: postgres
     - name: Restart PostgreSQL on remote
       service:
@@ -165,10 +198,14 @@
       args:
         chdir: "{{ app_dir }}"
       environment:
-        DATABASE_URL: "postgresql://{{ db_user }}:{{ db_pass }}@localhost:5433/{{ db_name }}"
+        DATABASE_URL: "postgresql://{{ db_user }}:{{ db_pass }}@localhost:{{ remote_port }}/{{ db_name }}"
   handlers:
     - name: Restart PostgreSQL local
       delegate_to: localhost
+      service:
+        name: postgresql
+        state: restarted
+    - name: Restart PostgreSQL on remote
       service:
         name: postgresql
         state: restarted
