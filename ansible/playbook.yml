@@ -1,0 +1,174 @@
+---
+- hosts: local
+  become: yes
+  vars_files:
+    - group_vars/all/vault.yml
+  vars:
+    db_name: mydb
+    db_user: postgres
+    db_pass: "{{ db_pass }}"
+    app_dir: /opt/fastapi_crud
+  tasks:
+    - name: Install deps
+      apt:
+        name: [python3-pip, postgresql, libpq-dev, git, python3-venv]
+        state: present
+    - name: Create DB
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        login_host: localhost
+        login_port: 5433
+    - name: Set up DB user privileges
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_pass }}"
+        db: "{{ db_name }}"
+        priv: "ALL"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        login_host: localhost
+        login_port: 5433
+    - name: Ensure app directory exists
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+    - name: Copy app folder
+      copy:
+        src: ../app/
+        dest: "{{ app_dir }}/app/"
+    - name: Copy alembic folder
+      copy:
+        src: ../alembic/
+        dest: "{{ app_dir }}/alembic/"
+    - name: Copy alembic.ini
+      copy:
+        src: ../alembic.ini
+        dest: "{{ app_dir }}/alembic.ini"
+    - name: Copy requirements.txt
+      copy:
+        src: ../requirements.txt
+        dest: "{{ app_dir }}/requirements.txt"
+    - name: Install reqs in venv
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: "python3 -m venv"
+    - name: Run Alembic migrations
+      command: "{{ app_dir }}/venv/bin/alembic upgrade head"
+      args:
+        chdir: "{{ app_dir }}"
+
+- hosts: remote_db
+  become: yes
+  vars_files:
+    - group_vars/all/vault.yml
+  vars:
+    ansible_ssh_pass: "{{ ssh_pass }}"
+    db_name: mydb
+    db_user: postgres
+    db_pass: "{{ db_pass }}"
+    primary_ip: "{{ hostvars['localhost'].ansible_default_ipv4.address }}"
+    repl_user: repl_user
+    repl_pass: "{{ repl_pass }}"
+    app_dir: /root/fastapi_crud
+  tasks:
+    - name: Ensure app directory exists
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+    - name: Copy app folder
+      copy:
+        src: ../app/
+        dest: "{{ app_dir }}/app/"
+    - name: Copy alembic folder
+      copy:
+        src: ../alembic/
+        dest: "{{ app_dir }}/alembic/"
+    - name: Copy alembic.ini
+      copy:
+        src: ../alembic.ini
+        dest: "{{ app_dir }}/alembic.ini"
+    - name: Copy requirements.txt
+      copy:
+        src: ../requirements.txt
+        dest: "{{ app_dir }}/requirements.txt"
+    - name: Install PostgreSQL and deps
+      apt:
+        name: [postgresql, python3-psycopg2, python3-pip, python3-venv]
+        state: present
+    - name: Create DB
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        login_host: localhost
+        login_port: 5433
+    - name: Create DB user
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_pass }}"
+        db: "{{ db_name }}"
+        priv: "ALL"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        login_host: localhost
+        login_port: 5433
+    - name: Configure primary for replication
+      delegate_to: localhost
+      lineinfile:
+        path: /etc/postgresql/*/main/postgresql.conf
+        line: "wal_level = replica\nmax_wal_senders = 10\nlisten_addresses = '*'"
+      notify: Restart PostgreSQL local
+    - name: Create replication user on primary
+      delegate_to: localhost
+      postgresql_user:
+        name: "{{ repl_user }}"
+        password: "{{ repl_pass }}"
+        role_attr_flags: REPLICATION
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_pass }}"
+        login_host: localhost
+        login_port: 5433
+    - name: Allow replication in pg_hba.conf on primary
+      delegate_to: localhost
+      lineinfile:
+        path: /etc/postgresql/*/main/pg_hba.conf
+        line: "host replication {{ repl_user }} 0.0.0.0/0 md5"
+      notify: Restart PostgreSQL local
+    - name: Initial sync to remote
+      command: pg_basebackup -h {{ primary_ip }} -p 5433 -D /var/lib/postgresql/*/main -U {{ repl_user }} -v -P --wal-method=stream
+      become_user: postgres
+    - name: Configure standby on remote
+      copy:
+        content: |
+          standby_mode = 'on'
+          primary_conninfo = 'host={{ primary_ip }} port=5433 user={{ repl_user }} password={{ repl_pass }}'
+        dest: /var/lib/postgresql/*/main/recovery.conf
+      become_user: postgres
+    - name: Restart PostgreSQL on remote
+      service:
+        name: postgresql
+        state: restarted
+    - name: Install reqs on remote in venv
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: "python3 -m venv"
+    - name: Run Alembic migrations on remote
+      command: "{{ app_dir }}/venv/bin/alembic upgrade head"
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        DATABASE_URL: "postgresql://{{ db_user }}:{{ db_pass }}@localhost:5433/{{ db_name }}"
+  handlers:
+    - name: Restart PostgreSQL local
+      delegate_to: localhost
+      service:
+        name: postgresql
+        state: restarted

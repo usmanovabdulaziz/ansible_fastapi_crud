@@ -1,0 +1,30 @@
+- name: Install psycopg2
+  apt:
+    name: python3-psycopg2
+    state: present
+    update_cache: yes
+
+- name: Install PostgreSQL
+  apt:
+    name: postgresql
+    state: present
+    update_cache: yes
+
+- name: Ensure database is created
+  postgresql_db:
+    name: mydb
+    login_user: postgres
+    login_password: "19283746"
+    login_host: localhost
+    login_port: 5433
+
+- name: Ensure user is created
+  postgresql_user:
+    name: user
+    password: "19283746"
+    priv: "ALL"
+    login_user: postgres
+    login_password: "19283746"
+    login_host: localhost
+    login_port: 5433
+
